@@ -34,12 +34,13 @@ const Type = std.builtin.Type;
 ///             _ = match;
 ///         }
 ///     },
-/// })
+/// }).init(state_object, src_string)
 /// ```
 pub fn Lexer(comptime State: type, comptime tokens: anytype) type {
-    _ = State;
-
     return struct {
+        state: State,
+        
+        const Self = @This();
         pub const Token = TokenUnion(TokenTag(tokens), tokens);
     };
 }
@@ -391,6 +392,8 @@ const Range = struct {
         }
     };
 };
+
+/// This is an update
 
 /// Errors that can occur when parsing regex
 pub const ParseError = error{
