@@ -1,5 +1,4 @@
 const std = @import("std");
-const Type = std.builtin.Type;
 
 /// Generates a lexer iterator with a method that returns an union defining the matched token
 /// ---
@@ -15,7 +14,7 @@ const Type = std.builtin.Type;
 /// Lexer(void, .{
 ///     .variant_with_void_type = "matching_pattern",
 ///     .plus_eq = "+=",
-///     .variant_with_type_or_action = struct {
+///     .number = struct {
 ///         pub const capture = "(0|([1-9][0-9]*))(.[0-9]+)?";
 ///
 ///         // You can omit this if you like, which will make this equivalent to the above patterns
@@ -39,361 +38,473 @@ const Type = std.builtin.Type;
 pub fn Lexer(comptime State: type, comptime tokens: anytype) type {
     return struct {
         state: State,
-        
+
         const Self = @This();
         pub const Token = TokenUnion(TokenTag(tokens), tokens);
     };
 }
 
-// Generates an enum, every variant corresponding to a struct field passed in
-// ---
-// - `tokens` generate a unique variant for each member of the anonymous struct
-fn TokenTag(comptime tokens: anytype) type {
-    const fields = std.meta.fields(@TypeOf(tokens));
-    var variants: [fields.len]Type.EnumField = undefined;
-    for (fields, 0..) |field, idx| {
-        variants[idx] = .{ .name = field.name, .value = idx };
-    }
 
-    return @Type(Type{ .Enum = .{
-        .tag_type = std.math.IntFittingRange(0, fields.len),
-        .fields = &variants,
-        .decls = &.{},
-        .is_exhaustive = false,
-    } });
-}
+/// Describes a final state index and its corresponding token that it finishes
+const Final = struct {
+    /// What index in the states array this final state is
+    idx: usize,
 
-/// Generates a union with every variant corresponding to a struct field passed in
-/// ---
-/// - `Tag` the tag for the generated union to use (must have same variant names as fields's fields)
-/// - `fields` fields to generate variants for, with same names as variants in Tag
-fn TokenUnion(comptime Tag: type, comptime tokens: anytype) type {
-    const tag_variants = std.meta.fields(Tag);
-    var union_variants: [tag_variants.len]Type.UnionField = undefined;
-    for (tag_variants, &union_variants) |tag_variant, *union_variant| {
-        // This is the real value of the field, which may be a `str` or a `type` refrencing a struct
-        const field = @field(tokens, tag_variant.name);
-
-        // If the type of it is a `type` and that type has a function `action`, get it's return type
-        const VariantType = if (@TypeOf(field) == type and @hasDecl(field, "action"))
-            switch (@typeInfo(@TypeOf(field.action))) {
-                // If its an error union, get its underlying type
-                .Fn => |fn_info| switch (@typeInfo(fn_info.return_type orelse void)) {
-                    .ErrorUnion => |return_info| return_info.payload,
-                    else => fn_info.return_type orelse void,
-                },
-                else => void,
-            }
-        else
-            void;
-
-        // Use the found type to generate the union variant
-        union_variant.* = .{
-            .name = tag_variant.name,
-            .type = VariantType,
-            .alignment = @alignOf(VariantType),
-        };
-    }
-
-    return @Type(Type{ .Union = .{
-        .layout = .auto,
-        .tag_type = Tag,
-        .fields = &union_variants,
-        .decls = &.{},
-    } });
-}
-
-/// Represents a range of characters to match against
-const Range = struct {
-    /// Where this was parsed from
-    src: []const u8,
-
-    /// Where the ranges start (must be same length as end)
-    start: []const u21,
-
-    /// Where the ranges end (inclusive) (must be same length as start)
-    end: []const u21,
-    
-    /// Maximum number of ranges allowed when computing a range object
-    const max_ranges = 64;
-
-    /// Parses a range pattern
-    /// ---
-    /// - `src` source string (end of `src` may be past the end of the range).
-    ///     `src` can *NOT* contain escape sequences, but may contain POSIX character classes and
-    ///     raw utf-8 encoding.
-    /// ---
-    /// returns:
-    /// - Either a `ParseError` or a sorted, non-overlapping `Range`
-    pub fn parse(comptime src: []const u8) ParseError!Range {
-        const parsed = try parseRawRanges(src);
-        const sorted = sortRange(parsed[1]);
-        const coalessed = coalessRange(sorted);
-        return if (parsed[0]) try invertRange(coalessed) else coalessed;
-    }
-
-    /// Inverts a sorted, non-overlapping range making sure create distinct, sorted sections
-    fn invertRange(comptime range: Range) ParseError!Range {
-        // Since the range covers the entire domain of u21, return nothing
-        if (range.start[0] == 0 and range.end[0] == std.math.maxInt(u21)) {
-            return .{
-                .src = range.src,
-                .start = &.{},
-                .end = &.{},
-            };
-        }
-    
-        var starts = std.BoundedArray(u21, max_ranges).init(0) catch unreachable;
-        var ends = std.BoundedArray(u21, max_ranges).init(0) catch unreachable;
-        
-        // If the first block starts at 1, start at the block after that one (hence idx = 1)
-        var idx: usize = @intFromBool(range.start[0] == 0);
-        var start: u21 = if (idx == 1) range.end[0] + 1 else 0;
-        while (idx < range.start.len) : (idx += 1) {
-            // Append the range and set the starting point for the next one
-            starts.append(start) catch return ParseError.OutOfMemory;
-            ends.append(range.start[idx] - 1) catch return ParseError.OutOfMemory;
-            start = range.end[idx] +% 1;
-        }
-        
-        // start will overlap to 0 if the final block ends at the end of the u21 domain. If that
-        // doesn't happen, we add 1 more block to cover the end of the domain
-        if (start != 0) {
-            starts.append(start) catch return ParseError.OutOfMemory;
-            ends.append(std.math.maxInt(u21)) catch return ParseError.OutOfMemory;
-        }
-        
-        // Finalize the variables for comptime
-        std.debug.assert(starts.len == ends.len);
-        const final_starts = starts.buffer;
-        const final_ends = ends.buffer;
-        return .{
-            .src = range.src,
-            .start = final_starts[0..starts.len],
-            .end = final_ends[0..starts.len],
-        };
-    }
-    
-    /// Computes a `Range` without overlapping ranges
-    fn coalessRange(comptime sorted: Range) Range {
-        // Now that we know the order we can start coallesing ranges
-        var starts: [sorted.start.len]u21 = undefined;
-        var ends: [sorted.end.len]u21 = undefined;
-        @memcpy(&starts, sorted.start);
-        @memcpy(&ends, sorted.end);
-
-        var start = 0; // This is were we originally started this range
-        var end = 1; // This is the last range we found that is apart of the starting one
-        while (end < starts.len) : (end += 1) {
-            if (starts[end] <= ends[start] +| 1) {
-                // Extend the range if this one is bigger
-                ends[start] = @max(ends[end], ends[start]);
-            } else {
-                // End the range (and start a new one)
-                start += 1;
-                starts[start] = starts[end];
-                ends[start] = ends[end];
-            }
-        }
-
-        const final_starts = starts;
-        const final_ends = ends;
-        return .{
-            .src = sorted.src,
-            .start = final_starts[0 .. start + 1],
-            .end = final_ends[0 .. start + 1],
-        };
-    }
-
-    /// Computes an ordered `Range` from a unordered `Range` (ranges may still overlap) by starting
-    /// position in the ranges
-    fn sortRange(comptime unsorted: Range) Range {
-        // Remove overlapping ranges by starting with sorting them
-        var order: [unsorted.start.len]usize = undefined;
-        for (0..order.len) |i| {
-            order[i] = i;
-        }
-        const SortContext = struct {
-            starts: []const u21,
-            pub fn lessThanFn(ctx: @This(), lhs: usize, rhs: usize) bool {
-                return ctx.starts[lhs] < ctx.starts[rhs];
-            }
-        };
-        std.mem.sortUnstable(usize, &order, SortContext{
-            .starts = unsorted.start,
-        }, SortContext.lessThanFn);
-
-        // Create ordered lists from the sorting algo.
-        var order_starts: [order.len]u21 = undefined;
-        var order_ends: [order.len]u21 = undefined;
-        var order_len = 0;
-        for (order) |i| {
-            order_starts[order_len] = unsorted.start[i];
-            order_ends[order_len] = unsorted.end[i];
-            order_len += 1;
-        }
-        
-        const final_starts = order_starts;
-        const final_ends = order_ends;
-        return .{
-            .src = unsorted.src,
-            .start = &final_starts,
-            .end = &final_ends,
-        };
-    }
-
-    /// Only return the ranges encoded verbatim, they may be overlapping, or even out of order
-    /// ---
-    /// returns:
-    /// - A tuple containing a `bool` to specify whether or not the `Range` should be inverted later
-    fn parseRawRanges(comptime src: []const u8) ParseError!struct { bool, Range } {
-        // Make sure that we are starting with a range, and set the max number of ranges we accept
-        if (src[0] != '[') return ParseError.InvalidRangeFormat;
-
-        // Create arrays for the start and end of each range found
-        var starts = std.BoundedArray(u21, max_ranges).init(0) catch unreachable;
-        var ends = std.BoundedArray(u21, max_ranges).init(0) catch unreachable;
-        var negate = false;
-
-        // Parse the source
-        var idx: usize = 1;
-        if (src[idx] == ':') {
-            // Parse character classes (classes must be surrounded in [:class:])
-            idx += 1;
-
-            // This is where we start the character class name
-            const start = idx;
-            while (idx < src.len and src[idx] != ':') : (idx += 1) {}
-            if (src[idx] != ':') return ParseError.InvalidRangeFormat;
-
-            // Look up the character class and add it to the list
-            const ranges = (try Class.parse(src[start..idx])).getRanges();
-            var range: usize = 0;
-            while (range < ranges.len) : (range += 2) {
-                starts.append(ranges[range + 0]) catch return ParseError.OutOfMemory;
-                ends.append(ranges[range + 1]) catch return ParseError.OutOfMemory;
-            }
-            idx += 1;
-        } else {
-            negate = src[idx] == '^';
-            if (negate) idx += 1;
-
-            // Parse ranges
-            while (src[idx] != ']') {
-                // Its not a character range, but this is including another range
-                if (src[idx] == '[') {
-                    const range = try Range.parse(src[idx..]);
-                    idx += range.src.len;
-                    for (range.start, range.end) |start, end| {
-                        starts.append(start) catch return ParseError.OutOfMemory;
-                        ends.append(end) catch return ParseError.OutOfMemory;
-                    }
-                    continue;
-                }
-
-                // Read in starting character
-                const start = try readChar(src, &idx);
-                starts.append(start) catch return ParseError.OutOfMemory;
-
-                // Its a single character range, so skip it
-                if (src[idx] != '-') {
-                    ends.append(start) catch return ParseError.OutOfMemory;
-                    continue;
-                } else {
-                    idx += 1;
-                }
-
-                // Read in the ending character of the range
-                const end = try readChar(src, &idx);
-                ends.append(end) catch ParseError.OutOfMemory;
-                if (start > end) {
-                    // Reverse the range since they put it in backwards :/
-                    std.mem.swap(u21, &starts.buffer[starts.len - 1], &ends.buffer[ends.len - 1]);
-                }
-            }
-        }
-
-        // Make sure we have a correctly formatted range
-        std.debug.assert(starts.len == ends.len);
-        if (starts.len == 0 or src[idx] != ']') return ParseError.InvalidRangeFormat;
-        idx += 1;
-
-        // Finalize the variables for comptime
-        const final_starts = starts.buffer;
-        const final_ends = ends.buffer;
-        return .{
-            negate,
-            .{
-                .src = src[0 .. idx],
-                .start = final_starts[0..starts.len],
-                .end = final_ends[0..starts.len],
-            }
-        };
-    }
-
-    /// Returns true if the range can be cut to only include ascii characters and not lose
-    /// important data
-    pub fn isAscii(self: Range) bool {
-        // Since ranges are sorted only look at the final range
-        const start = self.start[self.start.len - 1];
-        const end = self.end[self.end.len - 1];
-        return start <= 0x80 and end == std.math.maxInt(u21) or end < 0x80;
-    }
-
-    /// Helper function to read a UTF8 character
-    fn readChar(comptime src: []const u8, i: *usize) ParseError!u21 {
-        const n = std.unicode.utf8ByteSequenceLength(src[i.*]) catch return ParseError.InvalidUTF8;
-        const c = std.unicode.utf8Decode(src[i.*..][0..n]) catch return ParseError.InvalidUTF8;
-        i.* += n;
-        return c;
-    }
-
-    /// A character class (names match)
-    const Class = enum {
-        alnum,
-        alpha,
-        ascii,
-        blank,
-        cntrl,
-        digit,
-        graph,
-        lower,
-        print,
-        punct,
-        space,
-        upper,
-        word,
-        xdigit,
-
-        // Tries to get the character class from a string
-        // - `str` string of the class name *only*. It should end at the end of the name.
-        pub fn parse(str: []const u8) ParseError!Class {
-            return std.meta.stringToEnum(Class, str) orelse return ParseError.InvalidRangeFormat;
-        }
-
-        /// Returns an array of [start, end, start, end, ...]
-        pub fn getRanges(comptime self: Class) []const u21 {
-            return switch (self) {
-                .alnum => &[_]u21{ 'a', 'z', 'A', 'Z', '0', '9' },
-                .alpha => &[_]u21{ 'a', 'z', 'A', 'Z' },
-                .ascii => &[_]u21{ 0x00, 0x7F },
-                .blank => &[_]u21{ ' ', ' ', '\t', '\t' },
-                .cntrl => &[_]u21{ 0x00, 0x1F, 0x7F },
-                .digit => &[_]u21{ '0', '9' },
-                .graph => &[_]u21{ '!', '~' },
-                .lower => &[_]u21{ 'a', 'z' },
-                .print => &[_]u21{ ' ', '~' },
-                .punct => &[_]u21{ '!', '/', ':', '@', '[', '`', '{', '~' },
-                .space => &[_]u21{ ' ', ' ', 0x09, 0x0D },
-                .upper => &[_]u21{ 'A', 'Z' },
-                .word => &[_]u21{ 'a', 'z', 'A', 'Z', '0', '9', '_', '_' },
-                .xdigit => &[_]u21{ '0', '9', 'a', 'f', 'A', 'F' },
-            };
-        }
-    };
+    /// A token identifier.
+    tok: usize,
 };
 
-/// This is an update
+/// A nondeterministic finite automata
+const Nfa = struct {
+    /// Which is the starting state
+    start: usize,
+
+    /// What state is the ending state
+    final: []const Final,
+
+    /// The backing list of states
+    states: []const State,
+
+    /// Describes a transition (line) connecting this state to another one
+    pub const Transition = union(enum) {
+        /// This is a lambda transition
+        lambda: usize,
+
+        /// Describes what bytes this state transitions on. Null defined error transitions.
+        symbol: [256]?usize,
+
+        /// Temporary value used when parsing to represent unconnected nodes
+        pub const unconnected = std.math.maxInt(usize);
+
+        /// Returns a symbol state transition with all null states
+        pub fn nullSymbols() Transition {
+            return .{ .symbol = [1]?usize{null} ** 256 };
+        }
+
+        /// Sets all unconnected values in the transition to the state specified
+        /// ---
+        /// returns: `true` if it connected atleast one unconnected transition
+        pub fn connect(self: *Transition, con: usize) bool {
+            var connected = false;
+            switch (self.*) {
+                .lambda => |*trans| if (trans.* == unconnected) {
+                    trans.* = con;
+                    connected = true;
+                },
+                .symbol => |*symbols| for (symbols) |*symbol| {
+                    if (symbol.* == unconnected) {
+                        connected = true;
+                        symbol.* = con;
+                    }
+                },
+            }
+            return connected;
+        }
+
+        /// Shifts transition refrences by `offs`
+        pub fn offset(comptime self: *Transition, offs: usize) void {
+            switch (self.*) {
+                .lambda => |*trans| if (trans.* != unconnected) {
+                    trans.* += offs;
+                },
+                .symbol => |*symbols| for (symbols) |*symbol| {
+                    if (symbol.* != unconnected) {
+                        symbol.* += offs;
+                    }
+                },
+            }
+        }
+    };
+
+    /// This is required to be passed into the regex in order for it to be able to run the analysis
+    /// it needs to do
+    const ParseState = struct {
+        /// The source we are parsing
+        src: []const u8,
+
+        /// Where we are in source
+        idx: usize = 0,
+
+        /// The backing allocator used to make new nodes
+        s: std.BoundedArray(State, 512) = .{ .len = 0 },
+
+        /// Throws a compile error with info of where it happened
+        pub inline fn err(comptime self: ParseState, comptime msg: []const u8) noreturn {
+            @compileError(std.fmt.comptimePrint(
+                "zlex error at \"{s}\": {s}",
+                .{ self.src[self.idx..], msg },
+            ));
+        }
+
+        /// Returns the index of the newly added state
+        pub fn add(comptime self: *ParseState, comptime state: State) usize {
+            self.*.s.append(state) catch self.err("regex out of NFA s");
+            return self.*.s.len - 1;
+        }
+
+        /// Returns a pointer to the NState at that index
+        pub fn at(comptime self: *ParseState, idx: usize) *State {
+            return &self.*.s.buffer[idx];
+        }
+
+        /// Connects all unconnected transitions at `from` index to the `to` index
+        pub fn con(comptime self: *ParseState, from: usize, to: usize) void {
+            const state = self.at(from);
+            var new_trans: [state.*.trans.len]Transition = state.*.trans[0..].*;
+            @memcpy(&new_trans, state.*.trans);
+            for (&new_trans) |*trans| {
+                _ = trans.*.connect(to);
+            }
+            state.*.trans = &new_trans;
+        }
+    };
+
+    /// Represents an output of a regular expression, with a start and final state
+    const Expr = struct {
+        /// Index of start state
+        start: usize,
+
+        /// Index of final state
+        final: usize,
+
+        /// Sets both the start and final index to the index passed in, making the `Expr` a single
+        /// state
+        pub fn single(expr: usize) Expr {
+            return .{ .start = expr, .final = expr };
+        }
+    };
+
+    /// Represents an NFA node
+    const State = struct {
+        /// The transitions for this NFA node
+        trans: []const Transition,
+
+        /// If specified, this state is a final state
+        token_id: ?usize = null,
+
+        /// Adds a transition to the transitions list
+        pub fn addTrans(comptime self: *State, trans: Transition) void {
+            const final: [self.*.trans.len]Transition = self.*.trans[0..].*;
+            const new = final ++ .{trans};
+            self.trans = &new;
+        }
+
+        /// Shifts every transition to be based off of base_idx, returns new state variable
+        pub fn shiftTrans(comptime self: State, base_idx: usize) State {
+            var new: [self.*.trans.len]Transition = self.*.trans.*;
+            for (&new) |*trans| {
+                trans.offset(base_idx);
+            }
+            const final = new;
+            return .{ .trans = final };
+        }
+    };
+
+    /// Parses a regular expression and turns it into a NFA. If an error occurs, it
+    /// throws a `@compileError`
+    pub fn parse(comptime src: []const u8, token_id: usize) Nfa {
+        // Set branch quota
+        @setEvalBranchQuota(src.len * 1000);
+
+        // Parse the regex
+        var state = ParseState{ .src = src };
+        const expr = parseExpr(&state);
+        const states: [state.s.len]State = state.s.buffer[0..state.s.len].*;
+        return .{
+            .start = expr.start,
+            .final = &.{.{
+                .idx = expr.final,
+                .tok = token_id,
+            }},
+            .states = &states,
+        };
+    }
+
+    /// Parses a regular expression and turns it into a NFA. If an error occurs, it
+    /// throws a `@compileError`
+    /// ---
+    /// - `s` internal parser state
+    /// ---
+    /// returns:
+    /// - a `usize` representing the index of the parsed NState in state's backing array
+    fn parseExpr(comptime s: *ParseState) Expr {
+        const is_grp = s.*.src[s.*.idx] == '(';
+        s.*.idx += @intFromBool(is_grp);
+
+        // Every regex starts with a prefix node/instruction
+        var prefix = parsePrefix(s);
+
+        // Now we parse nodes that require previous nodes
+        var next = parseSuffix(s, prefix);
+        while (next) |n| {
+            prefix = n;
+            next = parseSuffix(s, prefix);
+        }
+
+        if (s.*.idx < s.*.src.len and s.src[s.*.idx] != ')') {
+            s.err("expected end of expression or group");
+        }
+        return prefix;
+    }
+
+    /// Tries to parse a suffix expression, if it can't it just gives up and returns null
+    fn parseSuffix(comptime s: *ParseState, left: Expr) ?Expr {
+        if (s.*.idx == s.*.src.len) return null;
+        const char = s.*.src[s.*.idx];
+
+        switch (char) {
+            '+' => {
+                // Add a epsilon transistion back to the start for looping
+                s.at(left.final).addTrans(.{ .lambda = left.start });
+                s.*.idx += 1;
+                return left;
+            },
+            '*' => {
+                // Add a begin and end epsilon 'state'
+                const final = s.add(.{ .trans = &.{
+                    .{ .lambda = Transition.unconnected },
+                } });
+                const start = s.add(.{ .trans = &.{
+                    .{ .lambda = left.start },
+                    .{ .lambda = final },
+                } });
+                s.con(left.final, final);
+                s.at(left.final).*.addTrans(.{ .lambda = left.start });
+                s.*.idx += 1;
+                return .{ .start = start, .final = final };
+            },
+            '?', '|' => {
+                // Add an epsilon transition around the node and connect the two
+                const rejoin = s.add(.{ .trans = &.{
+                    .{ .lambda = Transition.unconnected },
+                } });
+                const split = s.add(.{ .trans = &.{
+                    .{ .lambda = left.start },
+                    .{ .lambda = rejoin },
+                } });
+                s.*.idx += 1;
+
+                // If we read the alternation '|' character, then read in the right side instead
+                if (char == '|') {
+                    const right = parseExpr(s);
+                    s.con(right.final, rejoin);
+                    s.at(split).*.trans = &.{
+                        .{ .lambda = left.start },
+                        .{ .lambda = right.start },
+                    };
+                } else {
+                    s.con(left.final, rejoin);
+                }
+
+                return .{ .start = split, .final = rejoin };
+            },
+            else => {
+                // Well, we're parsing another terminal/symbol... So lets do concatination
+                const symbol = parsePrefix(s);
+                s.con(left.final, symbol.start);
+                return .{
+                    .start = left.start,
+                    .final = symbol.final,
+                };
+            },
+        }
+    }
+
+    /// Parse a prefix instruction (basically a terminal, or group instruction, etc)
+    /// These nodes don't take anything in and only produce output
+    fn parsePrefix(comptime s: *ParseState) Expr {
+        if (s.*.src[s.*.idx] == '(') {
+            // Parse a group expr
+            return parse(s);
+        } else {
+            // Parse a symbol (terminal)
+            const range = Range.parse(s.*.src[s.*.idx..]) catch s.err("invalid range format");
+            const expr = fromRange(s, range);
+            s.*.idx += range.src.len;
+            return expr;
+        }
+    }
+
+    /// Match all within a range
+    /// ---
+    /// returns:
+    /// - a tuple with the input state, and the final state of this terminal
+    pub fn fromRange(comptime s: *ParseState, comptime range: Range) Expr {
+        if (range.isAscii()) {
+            // We only need 1 node for this.
+            var t = Transition.nullSymbols();
+            for (range.start, range.end) |start_unicode, end_unicode| {
+                const start: u8 = @intCast(start_unicode);
+                const end = std.math.cast(u8, end_unicode) orelse std.math.maxInt(u8);
+                for (start..end + 1) |i| {
+                    t.symbol[i] = Transition.unconnected;
+                }
+            }
+            return Expr.single(s.add(.{ .trans = &.{t} }));
+        }
+
+        // TODO: Support UTF8
+        @compileError("zlex: UTF-8 support is currently not implemented at the moment");
+    }
+
+    /// Joins multiple nfa's creating an alternation node at the start (this is to allow multiple
+    /// tokens)
+    pub fn join(comptime nfas: []const Nfa) Nfa {
+        var states = std.BoundedArray(State, blk: {
+            var len = 1;
+            for (nfas) |nfa| {
+                len += nfa.states.len;
+            }
+            break :blk len;
+        }).init(0) catch unreachable;
+        var finals = std.BoundedArray(Final, blk: {
+            var len = 0;
+            for (nfas) |nfa| {
+                len += nfa.final.len;
+            }
+            break :blk len;
+        }).init(0) catch unreachable;
+        states.append(State{ .trans = &.{} }) catch unreachable;
+
+        var start_state = &states.buffer[0];
+        for (nfas) |nfa| {
+            const base_state = states.len;
+            start_state.addTrans(.{ .lambda = base_state });
+
+            for (nfa.states) |state| {
+                try states.append(state.shiftTrans(base_state)) catch unreachable;
+            }
+            for (nfa.final) |final| {
+                try finals.append(.{
+                    .idx = final.idx + base_state,
+                    .tok = final.tok,
+                });
+            }
+        }
+
+        const final_finals: [finals.buffer.len]Final = finals.buffer;
+        const final_states: [states.buffer.len]Final = states.buffer;
+        return .{
+            .start = 0,
+            .final = final_finals,
+            .states = final_states,
+        };
+    }
+
+    /// Finds all NFA nodes that are connected to this one by this transition
+    /// ---
+    /// - `nfa` the nfa in question
+    /// - `state` find states connected to this one
+    /// - `on` find all nodes by this transition, if null then epsilon transitions
+    /// ---
+    /// returns:
+    /// - A slice of NFA nodes this connects too
+    pub fn getNeighbors(comptime nfa: Nfa, comptime state: usize, comptime on: ?u8) []const usize {
+        var seen = std.BoundedArray(usize, 64).init(0) catch unreachable;
+        getNeighborsDepth(nfa, state, on, &seen, 0, false);
+        const final: [seen.len]usize = seen.slice().*;
+        return &final;
+    }
+
+    /// Real function to get neighbors.
+    /// ---
+    /// - `on` find all nodes connected by this transition (or if null, then epsilon transition)
+    /// - `seen` already seen nodes.
+    /// - `depth` at what depth we are at. If greater than 0, then don't traverse non-epsilon states
+    /// - `add` whether or not to add node to `seen`. Used for the first node most of the time.
+    /// ---
+    /// returns:
+    /// - the states present in `seen` and new states found by that transition (all sorted)
+    fn getNeighborsDepth(
+        comptime nfa: Nfa,
+        state: usize,
+        on: ?u8,
+        seen: *std.BoundedArray(usize, 64),
+        depth: usize,
+        add: bool,
+    ) void {
+        // If we're an already seen node, then stop
+        const insert_idx = blk: {
+            var idx: usize = seen.len / 2;
+            var level: usize = seen.len / 4;
+            while (level) : (level /= 2) {
+                if (state == seen[idx]) {
+                    // We already have this so don't search for any more
+                    return;
+                } else if (state > seen[idx]) {
+                    // Move to the left
+                    idx -= level;
+                } else {
+                    // Move to the right
+                    idx += level;
+                }
+            }
+            break :blk idx;
+        };
+
+        // Using the index of where the node (should) be, we can use that to insert our node
+        if (add) seen.insert(insert_idx, state);
+
+        // Recursivly add nodes neighbors
+        for (nfa.states[state].trans) |trans| {
+            switch (trans) {
+                .lambda => |to| getNeighborsDepth(Nfa, to, on, &seen, depth, true),
+                .symbol => |bytes| {
+                    if (depth < 1) {
+                        for (bytes) |to| {
+                            getNeighborsDepth(nfa, to, on, &seen, depth + 1, true);
+                        }
+                    }
+                },
+            }
+        }
+    }
+};
+
+/// Deterministic finite automata
+const Dfa = struct {
+    /// What state is the ending state
+    final: []const Final,
+
+    /// State transition table
+    trans: []const [256]u16,
+
+    /// Error state
+    const error_state = 0;
+
+    /// Start state
+    const start_state = 1;
+
+    /// Convert a NFA to a DFA
+    pub fn fromNfa(nfa: Nfa) Dfa {
+        // Set max number of dfa states (this also ensures no state explosion)
+        const max_states = nfa.states.len * nfa.states.len * 2;
+        const State = struct {
+            nfa_states: []const usize,
+            token_id: ?usize,
+        };
+        var states = std.BoundedArray(State, max_states).init(0) catch unreachable;
+        var trans = std.BoundedArray([256]u16, max_states).init(0) catch unreachable;
+
+        // Convert the NFA to a DFA
+
+        // Finalize the states and transitions
+        const final_trans: [trans.len][256]u16 = trans.slice().*;
+        const final_states = get_final_states: {
+            var finals = std.BoundedArray(Final, max_states).init(0) catch unreachable;
+            for (states.slice(), 0..) |state, idx| {
+                if (state.token_id) |tok| {
+                    finals.append(.{ .idx = idx, .tok = tok });
+                }
+            }
+            break :get_final_states finals.slice().*;
+        };
+        return .{
+            .final = &final_states,
+            .trans = &final_trans,
+        };
+    }
+};
 
 /// Errors that can occur when parsing regex
 pub const ParseError = error{
@@ -402,95 +513,9 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-test "Token" {
-    const lexer = Lexer(void, .{
-        .digit = struct {
-            pub const capture = "[0-9]";
-            pub fn action(_: void, match: []const u8) !u4 {
-                return match[0] - '0';
-            }
-        },
-        .ident = "[a-zA-Z_][a-zA-Z0-9_]*",
-        .plus = "+",
-        .minus = "-",
-    });
 
-    const tags = std.meta.fields(std.meta.Tag(lexer.Token));
-    try std.testing.expectEqualDeep(Type.EnumField{
-        .name = "digit",
-        .value = 0,
-    }, tags[0]);
-    try std.testing.expectEqualDeep(Type.EnumField{
-        .name = "ident",
-        .value = 1,
-    }, tags[1]);
-    try std.testing.expectEqualDeep(Type.EnumField{
-        .name = "plus",
-        .value = 2,
-    }, tags[2]);
-    try std.testing.expectEqualDeep(Type.EnumField{
-        .name = "minus",
-        .value = 3,
-    }, tags[3]);
 
-    const fields = std.meta.fields(lexer.Token);
-    try std.testing.expectEqualDeep(Type.UnionField{
-        .name = "digit",
-        .type = u4,
-        .alignment = 1,
-    }, fields[0]);
-    try std.testing.expectEqualDeep(Type.UnionField{
-        .name = "ident",
-        .type = void,
-        .alignment = 1,
-    }, fields[1]);
-    try std.testing.expectEqualDeep(Type.UnionField{
-        .name = "plus",
-        .type = void,
-        .alignment = 1,
-    }, fields[2]);
-    try std.testing.expectEqualDeep(Type.UnionField{
-        .name = "minus",
-        .type = void,
-        .alignment = 1,
-    }, fields[3]);
-}
-
-test "Range" {
-    const max = std.math.maxInt(u21);
-
-    // Test multiple values
-    var range = comptime try Range.parse("[abc]---");
-    try std.testing.expectEqualSlices(u21, &.{'a'}, range.start);
-    try std.testing.expectEqualSlices(u21, &.{'c'}, range.end);
-    try std.testing.expectEqualSlices(u8, "[abc]", range.src);
-    try std.testing.expectEqual(true, range.isAscii());
-
-    // Test negation
-    range = comptime try Range.parse("[^abc]other stuff");
-    try std.testing.expectEqualSlices(u21, &.{ 0x00, 'd' }, range.start);
-    try std.testing.expectEqualSlices(u21, &.{ '`', max }, range.end);
-    try std.testing.expectEqualSlices(u8, "[^abc]", range.src);
-    try std.testing.expectEqual(true, range.isAscii());
-    
-    // Test minus and reversed range
-    range = comptime try Range.parse("[--+]");
-    try std.testing.expectEqualSlices(u21, &.{ '+' }, range.start);
-    try std.testing.expectEqualSlices(u21, &.{ '-' }, range.end);
-    try std.testing.expectEqualSlices(u8, "[--+]", range.src);
-    try std.testing.expectEqual(true, range.isAscii());
-    
-    // Test character group
-    range = comptime try Range.parse("[:alnum:]");
-    try std.testing.expectEqualSlices(u21, &.{ '0', 'A', 'a' }, range.start);
-    try std.testing.expectEqualSlices(u21, &.{ '9', 'Z', 'z' }, range.end);
-    try std.testing.expectEqualSlices(u8, "[:alnum:]", range.src);
-    try std.testing.expectEqual(true, range.isAscii());
-    
-    // Test character group inversion
-    range = comptime try Range.parse("[^[:alnum:]]");
-    try std.testing.expectEqualSlices(u21, &.{ 0x00, ':', '[', '{' }, range.start);
-    try std.testing.expectEqualSlices(u21, &.{ '/', '@', '`', max }, range.end);
-    try std.testing.expectEqualSlices(u8, "[^[:alnum:]]", range.src);
-    try std.testing.expectEqual(true, range.isAscii());
+test "Dfa" {
+    const nfa = comptime Nfa.parse("(abc)|(def)*", 0);
+    @compileLog(comptime nfa.getNeighbors(nfa.start, null));
 }
