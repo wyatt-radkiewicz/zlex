@@ -139,6 +139,89 @@ pub fn rangeFragment(nfa: *Nfa, range: Range, next: usize) usize {
     }
 }
 
+/// Used in the process of finding neighbors of a state
+const NeighborFinder = struct {
+    array: std.BoundedArray(usize, 128),
+
+    const Self = @This();
+
+    pub fn init() Self {
+        return .{ .array = std.BoundedArray(usize, 128).init(0) catch unreachable };
+    }
+
+    /// Returns `true` if the state wasn't there, or `false` if it was already there
+    pub fn putState(self: *Self, state: usize) bool {
+        // Binary search to get the position where it either is, or where we are going to add it
+        var left: usize = 0;
+        var right: usize = self.*.array.len;
+        var idx = 0;
+        while (right - left > 1) {
+            idx = (left + right) / 2;
+            const mid = self.*.array.buffer[idx];
+
+            if (state > mid) {
+                left = idx + 1;
+            } else if (state < mid) {
+                right = idx;
+            } else {
+                // Found a match, return false
+                return false;
+            }
+        }
+
+        idx = if (self.*.array.len > 0 and state > self.*.array.buffer[left]) right else left;
+        self.*.array.insert(idx, state) catch @panic("nfa putState overflow!");
+        return true;
+    }
+
+    /// Find the neighbors for this set starting at this state. If depth is greater than 0, then
+    /// don't follow any non-lambda nodes
+    pub fn find(
+        self: *Self,
+        nfa: []const State,
+        state: usize,
+        exclude: usize,
+        on: ?u8,
+        depth: usize,
+    ) void {
+        inline for (nfa[state].trans) |trans| {
+            if (trans == null) continue;
+            if (switch (trans.?.on) {
+                .lambda => true,
+                .symbol => |bitset| depth < 1 and on != null and bitset.isSet(on.?),
+            } and trans.?.to != exclude and self.putState(trans.?.to)) {
+                self.find(
+                    nfa,
+                    trans.?.to,
+                    exclude,
+                    on,
+                    depth + @intFromBool(std.meta.activeTag(trans.?.on) == .lambda),
+                );
+            }
+        }
+    }
+};
+
+/// Find all direct neighbors of the specified state, while following lambda transitions
+/// This returns a sorted array with no repeating elements
+pub const Neighbors = struct {
+    /// The states the state is connected to (not including itself)
+    states: []const usize,
+
+    /// Shows that one of the states is an accept state with this token
+    token: ?usize,
+
+    pub fn find(nfa: []const State, state: usize, on: ?u8) Neighbors {
+        var neighbors = NeighborFinder.init();
+        neighbors.find(nfa, state, state, on, 0);
+        const final = neighbors.array.slice()[0..].*;
+        const token = for (final) |i| {
+            if (nfa[i].token) |token| break token;
+        } else null;
+        return .{ .states = &final, .token = token };
+    }
+};
+
 fn testSingleBitset(idx: usize) Trans.Input {
     var bitset = std.StaticBitSet(256).initFull();
     bitset.setValue(idx, true);
@@ -231,20 +314,31 @@ test "nfa construction" {
         }, null }, .token = null },
     }, comptime construct(parser.parse("a|b").ok, 0));
     try std.testing.expectEqualSlices(State, &.{
-            State{ .trans = .{ .{
-                .to = 2,
-                .on = .lambda,
-            }, .{
-                .to = 1,
-                .on = .lambda,
-            } }, .token = null },
-            State{ .trans = .{
-                null,
-                null,
-            }, .token = 0 },
-            State{ .trans = .{ .{
-                .to = 1,
-                .on = testSingleBitset('a'),
-            }, null }, .token = null },
-        }, comptime construct(parser.parse("a?").ok, 0));
+        State{ .trans = .{ .{
+            .to = 2,
+            .on = .lambda,
+        }, .{
+            .to = 1,
+            .on = .lambda,
+        } }, .token = null },
+        State{ .trans = .{
+            null,
+            null,
+        }, .token = 0 },
+        State{ .trans = .{ .{
+            .to = 1,
+            .on = testSingleBitset('a'),
+        }, null }, .token = null },
+    }, comptime construct(parser.parse("a?").ok, 0));
+}
+
+test "nfa neighbors" {
+    try std.testing.expectEqualDeep(
+        Neighbors{ .states = &.{ 2, 3 }, .token = null },
+        comptime Neighbors.find(construct(parser.parse("a|b").ok, 0), 0, null),
+    );
+    try std.testing.expectEqualDeep(
+        Neighbors{ .states = &.{ 1, 2, 3 }, .token = 0 },
+        comptime Neighbors.find(construct(parser.parse("a*").ok, 0), 0, 'a'),
+    );
 }
