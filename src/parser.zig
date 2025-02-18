@@ -40,8 +40,6 @@ pub fn parse(comptime src: []const u8) Result {
 }
 
 fn parseExpr(comptime src: *[]const u8) Error!*const Node {
-    src.* = src.*[@intFromBool(src.*[0] == '(')..];
-
     // Every regex starts with a prefix node/instruction
     var prefix = try parsePrefix(src);
 
@@ -57,6 +55,7 @@ fn parseExpr(comptime src: *[]const u8) Error!*const Node {
 
 fn parsePrefix(comptime src: *[]const u8) Error!*const Node {
     if (src.*[0] == '(') {
+        src.* = src.*[1..];
         return parseExpr(src);
     } else {
         // Parse a symbol (terminal)

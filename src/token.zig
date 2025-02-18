@@ -22,8 +22,7 @@ fn TokenTag(comptime tokens: anytype) type {
 
 /// Generates a union with every variant corresponding to a struct field passed in
 /// ---
-/// - `Tag` the tag for the generated union to use (must have same variant names as fields's fields)
-/// - `fields` fields to generate variants for, with same names as variants in Tag
+/// - `fields` fields to generate variants for
 fn Token(comptime tokens: anytype) type {
     const Tag = TokenTag(tokens);
     const tag_variants = std.meta.fields(Tag);
