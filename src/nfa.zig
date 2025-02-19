@@ -121,7 +121,7 @@ fn fragment(nfa: *Nfa, ast: *const parser.Node, next: usize) usize {
 /// Create a part of an nfa from a range
 pub fn rangeFragment(nfa: *Nfa, range: Range, next: usize) usize {
     if (range.isAscii()) {
-        var bitset = std.StaticBitSet(256).initFull();
+        var bitset = std.StaticBitSet(256).initEmpty();
         for (range.start, range.end) |start, end| {
             for (start..end + 1) |i| {
                 bitset.setValue(i, true);
@@ -141,11 +141,8 @@ pub fn rangeFragment(nfa: *Nfa, range: Range, next: usize) usize {
 
 /// Helper struct used in the finding of neighbor states in an nfa
 pub const Neighbors = struct {
-    /// These are nodes we've already visited, so don't visit them again
-    seen: std.BoundedArray(usize, 512),
-
     /// These are nodes that we should add as neighbors
-    added: std.BoundedArray(usize, 256),
+    seen: std.BoundedArray(usize, 256),
 
     /// What NFA we are getting neighbors for
     nfa: []const State,
@@ -156,8 +153,7 @@ pub const Neighbors = struct {
     /// Create an empty neighbors finder
     pub fn init(nfa: []const State, on: ?u8) Neighbors {
         return .{
-            .seen = std.BoundedArray(usize, 512).init(0) catch unreachable,
-            .added = std.BoundedArray(usize, 256).init(0) catch unreachable,
+            .seen = std.BoundedArray(usize, 256).init(0) catch unreachable,
             .nfa = nfa,
             .on = on,
         };
@@ -168,44 +164,41 @@ pub const Neighbors = struct {
     /// state can be the state you wish to find neighbors for. Each call of visit will
     /// add more nodes to the list
     pub fn visit(self: *Neighbors, state: usize, add_seen: bool) void {
-        // Add this node to the added list using a binary search/insert to preserve order
+        // Add this state to the added list using a binary search/insert to preserve order
         dont_add: {
             if (add_seen or self.on == null) {
+                for (self.seen.slice()) |seen| {
+                    if (seen == state) break :dont_add;
+                }
+                
                 var left = 0;
-                var right = self.added.len;
+                var right = self.seen.len;
                 while (right - left > 1) {
                     const mid = left + right / 2;
-                    const val = self.added.get(mid);
+                    const val = self.seen.get(mid);
 
                     if (state > val) {
                         left = mid + 1;
                     } else if (state < val) {
                         right = mid;
                     } else {
-                        // Don't add repeat nodes
-                        break :dont_add;
+                        // We already checked for the state
+                        unreachable;
                     }
                 }
 
-                const idx = if (left == self.added.len or state <= self.added.get(left))
+                // Where to add, before or after?
+                const idx = if (left == self.seen.len or state <= self.seen.get(left))
                     left
                 else
                     right;
 
-                // Insert the added node
-                self.added.insert(idx, state) catch {
+                // Insert the seen state
+                self.seen.insert(idx, state) catch {
                     @panic("nfa neighbors overflow");
                 };
             }
         }
-
-        // Check if we've already been seen, return if so
-        for (self.seen.slice()) |seen| {
-            if (seen == state) return;
-        }
-
-        // Add this node to the seen list
-        self.seen.append(state) catch @panic("nfa neighbors overflow");
 
         // Visit neighbors
         for (self.nfa[state].trans) |trans| {
@@ -224,13 +217,14 @@ pub const Neighbors = struct {
 
     /// Returns the neighbors found by the finder
     pub fn neighbors(self: Neighbors) []const usize {
-        const final: [self.added.len]usize = self.added.slice()[0..].*;
+        const final: [self.seen.len]usize = self.seen.slice()[0..].*;
         return &final;
     }
 };
 
+// Used in tests
 fn testSingleBitset(idx: usize) Trans.Input {
-    var bitset = std.StaticBitSet(256).initFull();
+    var bitset = std.StaticBitSet(256).initEmpty();
     bitset.setValue(idx, true);
     return .{ .symbol = bitset };
 }
@@ -254,6 +248,23 @@ test "nfa construction" {
             .on = testSingleBitset('b'),
         }, null }, .token = null },
     }, comptime construct(parser.parse("abc").ok, 0));
+    try std.testing.expectEqualSlices(State, &.{
+        State{ .trans = .{ .{
+            .to = 2,
+            .on = testSingleBitset('a'),
+        }, null }, .token = null },
+        State{ .trans = .{
+            null,
+            null,
+        }, .token = 0 },
+        State{ .trans = .{ .{
+            .to = 0,
+            .on = .lambda,
+        }, .{
+            .to = 1,
+            .on = .lambda,
+        } }, .token = null },
+    }, comptime construct(parser.parse("a+").ok, 0));
     try std.testing.expectEqualSlices(State, &.{
         State{ .trans = .{ .{
             .to = 3,
@@ -313,11 +324,11 @@ test "nfa construction" {
         }, .token = 0 },
         State{ .trans = .{ .{
             .to = 1,
-            .on = testSingleBitset('b'),
+            .on = testSingleBitset('a'),
         }, null }, .token = null },
         State{ .trans = .{ .{
             .to = 1,
-            .on = testSingleBitset('a'),
+            .on = testSingleBitset('b'),
         }, null }, .token = null },
     }, comptime construct(parser.parse("a|b").ok, 0));
     try std.testing.expectEqualSlices(State, &.{
@@ -350,6 +361,40 @@ test "nfa neighbors" {
         const nfa = construct(parser.parse("a*").ok, 0);
         var n = Neighbors.init(nfa, 'a');
         n.visit(0, false);
+        break :blk n.neighbors();
+    });
+
+    const nfa = comptime construct(parser.parse("a+").ok, 0);
+    try std.testing.expectEqualSlices(usize, &.{0}, comptime blk: {
+        var n = Neighbors.init(nfa, null);
+        n.visit(0, false);
+        break :blk n.neighbors();
+    });
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, comptime blk: {
+        var n = Neighbors.init(nfa, 'a');
+        n.visit(0, false);
+        break :blk n.neighbors();
+    });
+    try std.testing.expectEqualSlices(usize, &.{}, comptime blk: {
+        var n = Neighbors.init(nfa, 'b');
+        n.visit(0, false);
+        break :blk n.neighbors();
+    });
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, comptime blk: {
+        var n = Neighbors.init(nfa, 'a');
+        n.visit(2, false);
+        break :blk n.neighbors();
+    });
+    try std.testing.expectEqualSlices(usize, &.{}, comptime blk: {
+        var n = Neighbors.init(nfa, 'b');
+        n.visit(2, false);
+        break :blk n.neighbors();
+    });
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, comptime blk: {
+        var n = Neighbors.init(nfa, 'a');
+        n.visit(0, false);
+        n.visit(1, false);
+        n.visit(2, false);
         break :blk n.neighbors();
     });
 }
