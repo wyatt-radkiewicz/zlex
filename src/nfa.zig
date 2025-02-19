@@ -38,7 +38,7 @@ fn addState(nfa: *Nfa, state: State) usize {
 /// Manipulates the nfa so that the start state has the first index
 fn normalizeNfa(nfa: *Nfa, start: usize) void {
     // Move the state to the start
-    const start_state = nfa.buffer[start];
+    const start_state = nfa.get(start);
     std.mem.copyBackwards(State, nfa.buffer[1 .. start + 1], nfa.buffer[0..start]);
     nfa.buffer[0] = start_state;
 
@@ -139,86 +139,93 @@ pub fn rangeFragment(nfa: *Nfa, range: Range, next: usize) usize {
     }
 }
 
-/// Used in the process of finding neighbors of a state
-const NeighborFinder = struct {
-    array: std.BoundedArray(usize, 128),
-
-    const Self = @This();
-
-    pub fn init() Self {
-        return .{ .array = std.BoundedArray(usize, 128).init(0) catch unreachable };
-    }
-
-    /// Returns `true` if the state wasn't there, or `false` if it was already there
-    pub fn putState(self: *Self, state: usize) bool {
-        // Binary search to get the position where it either is, or where we are going to add it
-        var left: usize = 0;
-        var right: usize = self.*.array.len;
-        var idx = 0;
-        while (right - left > 1) {
-            idx = (left + right) / 2;
-            const mid = self.*.array.buffer[idx];
-
-            if (state > mid) {
-                left = idx + 1;
-            } else if (state < mid) {
-                right = idx;
-            } else {
-                // Found a match, return false
-                return false;
-            }
-        }
-
-        idx = if (self.*.array.len > 0 and state > self.*.array.buffer[left]) right else left;
-        self.*.array.insert(idx, state) catch @panic("nfa putState overflow!");
-        return true;
-    }
-
-    /// Find the neighbors for this set starting at this state. If depth is greater than 0, then
-    /// don't follow any non-lambda nodes
-    pub fn find(
-        self: *Self,
-        nfa: []const State,
-        state: usize,
-        exclude: usize,
-        on: ?u8,
-        depth: usize,
-    ) void {
-        inline for (nfa[state].trans) |trans| {
-            if (trans == null) continue;
-            if (switch (trans.?.on) {
-                .lambda => true,
-                .symbol => |bitset| depth < 1 and on != null and bitset.isSet(on.?),
-            } and trans.?.to != exclude and self.putState(trans.?.to)) {
-                self.find(
-                    nfa,
-                    trans.?.to,
-                    exclude,
-                    on,
-                    depth + @intFromBool(std.meta.activeTag(trans.?.on) == .lambda),
-                );
-            }
-        }
-    }
-};
-
-/// Find all direct neighbors of the specified state, while following lambda transitions
-/// This returns a sorted array with no repeating elements
+/// Helper struct used in the finding of neighbor states in an nfa
 pub const Neighbors = struct {
-    /// The states the state is connected to (not including itself)
-    states: []const usize,
+    /// These are nodes we've already visited, so don't visit them again
+    seen: std.BoundedArray(usize, 512),
 
-    /// Shows that one of the states is an accept state with this token
-    token: ?usize,
+    /// These are nodes that we should add as neighbors
+    added: std.BoundedArray(usize, 256),
 
-    pub fn find(nfa: []const State, state: usize, on: ?u8) Neighbors {
-        var neighbors = NeighborFinder.init();
-        neighbors.find(nfa, state, state, on, 0);
-        const final = neighbors.array.slice()[0..].*;
-        const token = for (final) |i| {
-            if (nfa[i].token) |token| break token;
-        } else null;
-        return .{ .states = &final, .token = token };
+    /// What NFA we are getting neighbors for
+    nfa: []const State,
+
+    /// What transitions we are adding states on
+    on: ?u8,
+
+    /// Create an empty neighbors finder
+    pub fn init(nfa: []const State, on: ?u8) Neighbors {
+        return .{
+            .seen = std.BoundedArray(usize, 512).init(0) catch unreachable,
+            .added = std.BoundedArray(usize, 256).init(0) catch unreachable,
+            .nfa = nfa,
+            .on = on,
+        };
+    }
+
+    /// Visit a node and add it to the seen list and possibly to the added list
+    /// If not being called recursivly, then add_seen should start out as false, and
+    /// state can be the state you wish to find neighbors for. Each call of visit will
+    /// add more nodes to the list
+    pub fn visit(self: *Neighbors, state: usize, add_seen: bool) void {
+        // Add this node to the added list using a binary search/insert to preserve order
+        dont_add: {
+            if (add_seen or self.on == null) {
+                var left = 0;
+                var right = self.added.len;
+                while (right - left > 1) {
+                    const mid = left + right / 2;
+                    const val = self.added.get(mid);
+
+                    if (state > val) {
+                        left = mid + 1;
+                    } else if (state < val) {
+                        right = mid;
+                    } else {
+                        // Don't add repeat nodes
+                        break :dont_add;
+                    }
+                }
+
+                const idx = if (left == self.added.len or state <= self.added.get(left))
+                    left
+                else
+                    right;
+
+                // Insert the added node
+                self.added.insert(idx, state) catch {
+                    @panic("nfa neighbors overflow");
+                };
+            }
+        }
+
+        // Check if we've already been seen, return if so
+        for (self.seen.slice()) |seen| {
+            if (seen == state) return;
+        }
+
+        // Add this node to the seen list
+        self.seen.append(state) catch @panic("nfa neighbors overflow");
+
+        // Visit neighbors
+        for (self.nfa[state].trans) |trans| {
+            if (trans == null) continue;
+            switch (trans.?.on) {
+                .lambda => self.visit(trans.?.to, add_seen),
+                .symbol => |bytes| {
+                    // If we've already 'added seen' then don't go any more that 1 away
+                    if (!add_seen and self.on != null and bytes.isSet(self.on.?)) {
+                        self.visit(trans.?.to, true);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Returns the neighbors found by the finder
+    pub fn neighbors(self: Neighbors) []const usize {
+        const final: [self.added.len]usize = self.added.slice()[0..].*;
+        return &final;
     }
 };
 
@@ -333,12 +340,16 @@ test "nfa construction" {
 }
 
 test "nfa neighbors" {
-    try std.testing.expectEqualDeep(
-        Neighbors{ .states = &.{ 2, 3 }, .token = null },
-        comptime Neighbors.find(construct(parser.parse("a|b").ok, 0), 0, null),
-    );
-    try std.testing.expectEqualDeep(
-        Neighbors{ .states = &.{ 1, 2, 3 }, .token = 0 },
-        comptime Neighbors.find(construct(parser.parse("a*").ok, 0), 0, 'a'),
-    );
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3 }, comptime blk: {
+        const nfa = construct(parser.parse("a|b").ok, 0);
+        var n = Neighbors.init(nfa, null);
+        n.visit(0, false);
+        break :blk n.neighbors();
+    });
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, comptime blk: {
+        const nfa = construct(parser.parse("a*").ok, 0);
+        var n = Neighbors.init(nfa, 'a');
+        n.visit(0, false);
+        break :blk n.neighbors();
+    });
 }
