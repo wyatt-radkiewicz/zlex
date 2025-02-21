@@ -9,24 +9,6 @@ pub const State = struct {
 
     /// non-null token represents accepting state
     token: ?usize = null,
-
-    pub fn format(
-        self: State,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
-        try writer.print("State{{ .trans = {{ ", .{});
-        for (self.trans, 0..) |t, i| {
-            if (t) |trans| {
-                try writer.print("'{c}' -> {}", .{ @as(u8, @truncate(i)), trans });
-            }
-        }
-        try writer.print(" }}, token = {?} }} }}", .{self.token});
-    }
 };
 
 /// When converting an nfa to a dfa, you use a set to track each of the new states
@@ -54,32 +36,21 @@ const Set = struct {
             }
         } else .{ .nfa_states = states, .dfa_state = .{} };
     }
-
-    pub fn format(
-        self: Set,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
-        try writer.print("Set{{ nfa_states = {any}, dfa_state = State{{ trans = .{{ ", .{self.nfa_states});
-        for (self.dfa_state.trans, 0..) |t, i| {
-            if (t) |trans| {
-                try writer.print("'{c}' -> {}", .{ i, trans });
-            }
-        }
-        try writer.print("}}, token = {?} }} }}", .{self.dfa_state.token});
-    }
 };
 
-/// Returns a transition table with the first entry corresponding to the starting state
+/// Runs the conversion and minimization code to give you a complete dfa
 pub fn convert(fa: []const nfa.State) []const State {
+    const dfa = nfa_to_dfa(fa);
+    return minimize(dfa);
+}
+
+/// Returns a transition table with the first entry corresponding to the starting state
+fn nfa_to_dfa(fa: []const nfa.State) []const State {
     // Create starting state
     var dfa = std.BoundedArray(Set, 1024).init(0) catch unreachable;
     dfa.append(Set.init(fa, &.{0}, null)) catch unreachable;
 
+    // A lot of logic happens here so set the branch eval quota accordingly
     @setEvalBranchQuota(fa.len * fa.len * 1000 * 1000);
 
     // Start finding neighbors as long as there are more
@@ -118,6 +89,141 @@ pub fn convert(fa: []const nfa.State) []const State {
     return &final_dfa;
 }
 
+/// Returns a bitset that can carry a set or unset for every state in the dfa
+fn BitSet(comptime dfa: []const State) type {
+    return std.StaticBitSet(dfa.len);
+}
+
+/// Gets the final states from a dfa as a set
+fn finalStates(comptime dfa: []const State) BitSet(dfa) {
+    var set = BitSet(dfa).initEmpty();
+    for (dfa, 0..) |d, i| {
+        if (d.token != null) set.set(i);
+    }
+    return set;
+}
+
+/// This will get every state that transitions to any state in `s` on transition `c`
+fn getTrans(comptime dfa: []const State, s: BitSet(dfa), c: u8) BitSet(dfa) {
+    // Use a bit set to automatically not do repeated counts
+    var is_trans = std.StaticBitSet(dfa.len).initEmpty();
+    var iter = s.iterator(.{});
+    while (iter.next()) |state| {
+        for (dfa, 0..) |d, i| {
+            if (d.trans[c] == state) is_trans.set(i);
+        }
+    }
+    return is_trans;
+}
+
+/// Add a state to the dfa from the minimized state set
+fn visitStateSet(
+    comptime dfa: []const State,
+    comptime p: []const BitSet(dfa),
+    comptime states: *std.BoundedArray(State, p.len),
+    comptime visited: []?usize,
+    state: usize,
+) usize {
+    const set = p[state];
+
+    // Go through every state in set to get information about the new dfa state
+    const dfa_state = states.addOne() catch unreachable;
+    visited[state] = states.len - 1;
+    var iter = set.iterator(.{});
+    while (iter.next()) |s| {
+        // If we come across a final state in the set, add it to the set
+        if (dfa[s].token) |t| dfa_state.*.token = t;
+
+        // It's harder to iterate over the bits so we go over every transition for this state
+        // here. Supposedly everything should work out fine, so no error checking here, just
+        // overwrite anything that is already there I guess.
+        for (0..256) |c| {
+            // Find where this transition would goto in the new dfa
+            const to = dfa[s].trans[c] orelse continue;
+            dfa_state.*.trans[c] = for (p, 0..) |j, k| {
+                if (j.isSet(to)) {
+                    if (visited[k]) |idx| {
+                        break idx;
+                    } else {
+                        break visitStateSet(dfa, p, states, visited, k);
+                    }
+                }
+            } else unreachable;
+        }
+    }
+
+    // Add the state
+    return visited[state].?;
+}
+
+/// There won't be any unreachable states, so just remove duplicate states
+/// This uses hopcroft's algorithm, which tbh I am not quite sure how it works
+fn minimize(dfa: []const State) []const State {
+    // All states and final states
+    const f = finalStates(dfa);
+    const q = BitSet(dfa).initFull();
+
+    // Partitions?
+    var p = std.BoundedArray(BitSet(dfa), dfa.len + 1).init(0) catch unreachable;
+    p.append(f) catch unreachable;
+    p.append(q.differenceWith(f)) catch unreachable;
+
+    // Words?
+    var w = std.BoundedArray(BitSet(dfa), dfa.len + 1).init(0) catch unreachable;
+    w.append(f) catch unreachable;
+    w.append(q.differenceWith(f)) catch unreachable;
+
+    while (w.len > 0) {
+        const a = w.orderedRemove(0);
+        for (0..256) |input| {
+            var i = 0;
+            while (i < p.len) : (i += 1) {
+                const x = getTrans(dfa, a, input);
+                const y = p.get(i);
+                const intr = x.intersectWith(y);
+                const diff = y.differenceWith(x);
+                const intr_cnt = intr.count();
+                const diff_cnt = diff.count();
+
+                if (intr_cnt == 0 or diff_cnt == 0) continue;
+                p.set(i, diff);
+                p.insert(i, intr) catch @panic("dfa minimization overflow!");
+                i += 1;
+
+                for (w.slice(), 0..) |j, k| {
+                    if (!j.eql(y)) {
+                        w.set(k, diff);
+                        w.insert(k, intr) catch @panic("dfa minimization overflow!");
+                        break;
+                    }
+                } else {
+                    if (intr_cnt <= diff_cnt) {
+                        w.append(intr) catch @panic("dfa minimization overflow!");
+                    } else {
+                        w.append(diff) catch @panic("dfa minimization overflow!");
+                    }
+                }
+            }
+        }
+    }
+
+    // `p` now contains a list of bitsets, where every bit set in each signifies that the new state
+    // at that index contains the state at that index as well
+    var states = std.BoundedArray(State, p.len).init(0) catch unreachable;
+
+    // Doubles up as something to show if a state set has been visited, and to map old state set
+    // indexes to new state sets
+    var visited = [1]?usize{null} ** p.len;
+
+    // Visit the initial state to make it the first index, and then visit everything after it
+    _ = visitStateSet(dfa, p.slice(), &states, &visited, for (p.slice(), 0..) |s, i| {
+        if (s.isSet(0)) break i;
+    } else unreachable);
+
+    const final = states.slice()[0..].*;
+    return &final;
+}
+
 /// Helper function to generate states
 fn testState(trans: []const struct { u8, usize }, token: ?usize) State {
     var state = State{ .token = token };
@@ -142,4 +248,7 @@ test "nfa to dfa conversion" {
         testState(&.{ .{ 'a', 1 }, .{ 'b', 1 } }, null),
         testState(&.{}, 0),
     }, comptime convert(nfa.construct(parser.parse("a|b").ok, 0)));
+    try std.testing.expectEqualSlices(State, comptime &.{
+        testState(&.{.{ 'a', 0 }}, 0),
+    }, comptime convert(nfa.construct(parser.parse("a*").ok, 0)));
 }

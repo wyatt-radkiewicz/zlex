@@ -44,9 +44,8 @@ fn normalizeNfa(nfa: *Nfa, start: usize) void {
 
     // Update refrences
     for (nfa.slice()) |*state| {
-        inline for (&state.*.trans) |*trans| {
-            if (trans.* == null) continue;
-            const to = &trans.*.?.to;
+        inline for (&state.*.trans) |*maybe_trans| {
+            const to = &(maybe_trans.* orelse continue).to;
             if (to.* < start) {
                 to.* += 1;
             } else if (to.* == start) {
@@ -124,7 +123,7 @@ pub fn rangeFragment(nfa: *Nfa, range: Range, next: usize) usize {
         var bitset = std.StaticBitSet(256).initEmpty();
         for (range.start, range.end) |start, end| {
             for (start..end + 1) |i| {
-                bitset.setValue(i, true);
+                bitset.set(i);
             }
         }
         return addState(nfa, .{
@@ -201,14 +200,14 @@ pub const Neighbors = struct {
         }
 
         // Visit neighbors
-        for (self.nfa[state].trans) |trans| {
-            if (trans == null) continue;
-            switch (trans.?.on) {
-                .lambda => self.visit(trans.?.to, add_seen),
+        for (self.nfa[state].trans) |maybe_trans| {
+            const trans = maybe_trans orelse continue;
+            switch (trans.on) {
+                .lambda => self.visit(trans.to, add_seen),
                 .symbol => |bytes| {
                     // If we've already 'added seen' then don't go any more that 1 away
                     if (!add_seen and self.on != null and bytes.isSet(self.on.?)) {
-                        self.visit(trans.?.to, true);
+                        self.visit(trans.to, true);
                     }
                 },
             }
@@ -225,7 +224,7 @@ pub const Neighbors = struct {
 // Used in tests
 fn testSingleBitset(idx: usize) Trans.Input {
     var bitset = std.StaticBitSet(256).initEmpty();
-    bitset.setValue(idx, true);
+    bitset.set(idx);
     return .{ .symbol = bitset };
 }
 
