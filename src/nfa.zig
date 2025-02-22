@@ -138,6 +138,50 @@ pub fn rangeFragment(nfa: *Nfa, range: Range, next: usize) usize {
     }
 }
 
+/// Combine multiple nfas into one by connecting all starting states to one* epsilon transition
+/// ---
+/// - `nfas` the nfas to combine
+/// ---
+/// returns:
+/// - the array containing the combined nfa
+pub fn combine(nfas: []const []const State) []const State {
+    // Its really simple to calculate the length of the new nfa.
+    var all = std.BoundedArray(State, blk: {
+        var len = nfas.len -| 1;
+        for (nfas) |nfa| {
+            len += nfa.len;
+        }
+        break :blk len;
+    }).init(0) catch unreachable;
+
+    // Add the nfas, setting their base indexes along the way
+    for (nfas, 0..) |nfa, i| {
+        // Add the connections
+        if (nfas.len - i > 1) {
+            all.appendAssumeCapacity(State{
+                .token = null,
+                .trans = .{
+                    .{ .to = all.len + 1, .on = .lambda },
+                    .{ .to = all.len + 1 + nfa.len, .on = .lambda },
+                },
+            });
+        }
+
+        const base_idx = all.len;
+        for (nfa) |state| {
+            var with_offset = state;
+            for (&with_offset.trans) |*maybe_trans| {
+                const trans = &(maybe_trans.* orelse continue);
+                trans.*.to += base_idx;
+            }
+            all.appendAssumeCapacity(with_offset);
+        }
+    }
+    
+    const final = all.slice()[0..].*;
+    return &final;
+}
+
 /// Helper struct used in the finding of neighbor states in an nfa
 pub const Neighbors = struct {
     /// These are nodes that we should add as neighbors
@@ -169,7 +213,7 @@ pub const Neighbors = struct {
                 for (self.seen.slice()) |seen| {
                     if (seen == state) break :dont_add;
                 }
-                
+
                 var left = 0;
                 var right = self.seen.len;
                 while (right - left > 1) {
@@ -347,6 +391,98 @@ test "nfa construction" {
             .on = testSingleBitset('a'),
         }, null }, .token = null },
     }, comptime construct(parser.parse("a?").ok, 0));
+}
+
+test "nfa combination" {
+    try std.testing.expectEqualSlices(State, &.{
+        State{
+            .token = null,
+            .trans = .{
+                Trans{ .to = 1, .on = .lambda },
+                Trans{ .to = 3, .on = .lambda },
+            },
+        },
+        State{
+            .token = null,
+            .trans = .{
+                Trans{ .to = 2, .on = .lambda },
+                null,
+            },
+        },
+        State{
+            .token = null,
+            .trans = .{ null, null },
+        },
+        State{
+            .token = null,
+            .trans = .{
+                Trans{ .to = 4, .on = .lambda },
+                Trans{ .to = 6, .on = .lambda },
+            },
+        },
+        State{
+            .token = null,
+            .trans = .{
+                Trans{ .to = 5, .on = .lambda },
+                null,
+            },
+        },
+        State{
+            .token = null,
+            .trans = .{ null, null },
+        },
+        State{
+            .token = null,
+            .trans = .{
+                Trans{ .to = 7, .on = .lambda },
+                null,
+            },
+        },
+        State{
+            .token = null,
+            .trans = .{ null, null },
+        },
+    }, comptime combine(&.{
+        &.{
+            State{
+                .token = null,
+                .trans = .{
+                    Trans{ .to = 1, .on = .lambda },
+                    null,
+                },
+            },
+            State{
+                .token = null,
+                .trans = .{ null, null },
+            },
+        },
+        &.{
+            State{
+                .token = null,
+                .trans = .{
+                    Trans{ .to = 1, .on = .lambda },
+                    null,
+                },
+            },
+            State{
+                .token = null,
+                .trans = .{ null, null },
+            },
+        },
+        &.{
+            State{
+                .token = null,
+                .trans = .{
+                    Trans{ .to = 1, .on = .lambda },
+                    null,
+                },
+            },
+            State{
+                .token = null,
+                .trans = .{ null, null },
+            },
+        },
+    }));
 }
 
 test "nfa neighbors" {

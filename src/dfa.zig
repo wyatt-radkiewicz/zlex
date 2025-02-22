@@ -48,7 +48,7 @@ pub fn convert(fa: []const nfa.State) []const State {
 fn nfa_to_dfa(fa: []const nfa.State) []const State {
     // Create starting state
     var dfa = std.BoundedArray(Set, 1024).init(0) catch unreachable;
-    dfa.append(Set.init(fa, &.{0}, null)) catch unreachable;
+    dfa.appendAssumeCapacity(Set.init(fa, &.{0}, null));
 
     // A lot of logic happens here so set the branch eval quota accordingly
     @setEvalBranchQuota(fa.len * fa.len * 1000 * 1000);
@@ -127,7 +127,7 @@ fn visitStateSet(
     const set = p[state];
 
     // Go through every state in set to get information about the new dfa state
-    const dfa_state = states.addOne() catch unreachable;
+    const dfa_state = states.addOneAssumeCapacity();
     visited[state] = states.len - 1;
     var iter = set.iterator(.{});
     while (iter.next()) |s| {
@@ -165,13 +165,13 @@ fn minimize(dfa: []const State) []const State {
 
     // Partitions?
     var p = std.BoundedArray(BitSet(dfa), dfa.len + 1).init(0) catch unreachable;
-    p.append(f) catch unreachable;
-    p.append(q.differenceWith(f)) catch unreachable;
+    p.appendAssumeCapacity(f);
+    p.appendAssumeCapacity(q.differenceWith(f));
 
     // Words?
     var w = std.BoundedArray(BitSet(dfa), dfa.len + 1).init(0) catch unreachable;
-    w.append(f) catch unreachable;
-    w.append(q.differenceWith(f)) catch unreachable;
+    w.appendAssumeCapacity(f);
+    w.appendAssumeCapacity(q.differenceWith(f));
 
     while (w.len > 0) {
         const a = w.orderedRemove(0);
