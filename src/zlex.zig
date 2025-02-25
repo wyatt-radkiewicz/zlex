@@ -49,8 +49,6 @@ pub fn Lexer(comptime ContextParam: type, comptime tokens: anytype) type {
     return struct {
         context: Context,
         src: []const u8,
-        line: usize,
-        col: usize,
 
         const Self = @This();
         const State = CompressedState(main_dfa);
@@ -61,7 +59,7 @@ pub fn Lexer(comptime ContextParam: type, comptime tokens: anytype) type {
         /// Creates a new lexer instance for this src string.
         /// This function only copies context state, and the src pointer. Very simple
         pub fn init(context: Context, src: []const u8) Self {
-            return .{ .context = context, .src = src, .line = 1, .col = 1 };
+            return .{ .context = context, .src = src };
         }
 
         /// This function finds the next token. If at the end of the source string, return null
@@ -293,6 +291,7 @@ fn compress(comptime fa: []const dfa.State) []const CompressedState(fa) {
 test "lexer" {
     const Lex = Lexer(void, .{
         .int = "int",
+        .str = "str",
         .eq = "=",
         .semicolon = ";",
         .ident = struct {
