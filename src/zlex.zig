@@ -66,35 +66,30 @@ pub fn Lexer(comptime ContextParam: type, comptime tokens: anytype) type {
 
         /// This function finds the next token. If at the end of the source string, return null
         pub fn next(self: *Self) anyerror!?Token {
-            const tok = self.matchSrc() orelse return null;
-
-            // Run the action to get the actual token value
-            return switch (tok[0]) {
-                inline 0...token_info.len - 1 => |id| self.tokenAction(token_info[id], tok[1]),
-                else => error.InvalidToken,
-            };
-        }
-
-        /// Run code to match against the source and get the token type. It will run as many times
-        /// as nessesary (considering skips) to get the final token.
-        pub fn matchSrc(self: *Self) ?struct { usize, []const u8 } {
-            // Run the DFA to get the matched contents and what token type to return
             return while (self.src.len != 0) {
-                var len: usize = 0;
-                var state: State.Trans = 0;
-                while (state < State.accept_states) : (len += 1) {
-                    const c = if (len < self.src.len) self.src[len] else 0;
-                    state = fa[state].trans[State.classes[c]];
+                const start = self.src;
+                var state: State.Trans = fa[0].trans[State.classes[self.src[0]]];
+                while (state < State.accept_states) {
+                    self.src = self.src[1..];
+                    state = fa[state].trans[
+                        State.classes[
+                            if (self.src.len > 0) self.src[0] else 0
+                        ]
+                    ];
                 }
-                len -= 1;
-                const src = self.src[0..len];
-                self.src = self.src[len..];
-                std.debug.print("match {} with len {}: \"{s}\" \"{s}\"\n", .{state, len, src, self.src});
 
-                std.debug.print("{} - {} ({})\n", .{state, State.accept_states, self.src.len});
-                const accept = state - State.accept_states;
-                if (state == State.err_state and !token_info[accept].skip) {
-                    break .{ accept, src };
+                // Run the action to get the actual token value
+                switch (state) {
+                    inline State.accept_states...State.accept_states + token_info.len - 1 => |i| {
+                        const id = i - State.accept_states;
+                        const src = start[0 .. @intFromPtr(self.src.ptr) - @intFromPtr(start.ptr)];
+                        if (token_info[id].skip) {
+                            _ = try self.tokenAction(token_info[id], src);
+                        } else {
+                            break self.tokenAction(token_info[id], src);
+                        }
+                    },
+                    else => break error.InvalidToken,
                 }
             } else null;
         }
@@ -270,7 +265,7 @@ fn CompressedState(comptime fa: []const dfa.State) type {
 fn compress(comptime fa: []const dfa.State) []const CompressedState(fa) {
     const Compressed = CompressedState(fa);
     var cfa: [Compressed.accept_states]Compressed = undefined;
-    
+
     @setEvalBranchQuota(1000000);
     for (fa, &cfa) |s, *cs| {
         // Convert all the transitions for this state

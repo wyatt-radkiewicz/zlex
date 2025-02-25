@@ -27,9 +27,30 @@ pub const Node = union(enum) {
     };
 };
 
+pub const Prec = enum {
+    alternation,
+    sequence,
+    factor,
+
+    pub fn underLevel(self: Prec, level: Prec) bool {
+        return @intFromEnum(self) <= @intFromEnum(level);
+    }
+
+    pub fn lowest() Prec {
+        return .alternation;
+    }
+
+    pub fn next(self: Prec) Prec {
+        return switch (self) {
+            else => @enumFromInt(@intFromEnum(self) + 1),
+            .factor => .factor,
+        };
+    }
+};
+
 pub fn parse(comptime src: []const u8) Result {
     var curr = src;
-    if (parseExpr(&curr)) |ast| {
+    if (parseExpr(&curr, Prec.lowest())) |ast| {
         return if (curr.len == 0) .{ .ok = ast } else .{ .err = .{
             .err = Error.InvalidFormat,
             .at = curr,
@@ -39,15 +60,13 @@ pub fn parse(comptime src: []const u8) Result {
     }
 }
 
-fn parseExpr(comptime src: *[]const u8) Error!*const Node {
+fn parseExpr(comptime src: *[]const u8, prec: Prec) Error!*const Node {
     // Every regex starts with a prefix node/instruction
     var prefix = try parsePrefix(src);
 
     // Now we parse nodes that require previous nodes
-    var next = try parseSuffix(src, prefix);
-    while (next) |n| {
-        prefix = n;
-        next = try parseSuffix(src, prefix);
+    while (try parseSuffix(src, prefix, prec)) |next| {
+        prefix = next;
     }
 
     return prefix;
@@ -56,7 +75,7 @@ fn parseExpr(comptime src: *[]const u8) Error!*const Node {
 fn parsePrefix(comptime src: *[]const u8) Error!*const Node {
     if (src.*[0] == '(') {
         src.* = src.*[1..];
-        return parseExpr(src);
+        return parseExpr(src, Prec.lowest());
     } else {
         // Parse a symbol (terminal)
         const range = try Range.parse(src.*);
@@ -65,29 +84,38 @@ fn parsePrefix(comptime src: *[]const u8) Error!*const Node {
     }
 }
 
-fn parseSuffix(comptime src: *[]const u8, left: *const Node) Error!?*const Node {
+fn parseSuffix(comptime src: *[]const u8, left: *const Node, prec: Prec) Error!?*const Node {
     if (src.*.len == 0) return null;
-    const char = src.*[0];
-    switch (char) {
-        '+', '*', '?', '|', ')' => {
+    switch (src.*[0]) {
+        '+' => if (prec.underLevel(.factor)) {
             src.* = src.*[1..];
-            if (char == ')') return null;
+            return &.{ .one_many = left };
         },
-        else => {},
+        '*' => if (prec.underLevel(.factor)) {
+            src.* = src.*[1..];
+            return &.{ .zero_many = left };
+        },
+        '?' => if (prec.underLevel(.factor)) {
+            src.* = src.*[1..];
+            return &.{ .optional = left };
+        },
+        '|' => if (prec.underLevel(.alternation)) {
+            src.* = src.*[1..];
+            return &.{ .either = .{
+                .left = left,
+                .right = try parseExpr(src, Prec.alternation.next()),
+            } };
+        },
+        ')' => src.* = src.*[1..],
+        else => if (prec.underLevel(.sequence)) {
+            return &.{ .sequence = .{
+                .left = left,
+                .right = try parseExpr(src, Prec.sequence.next()),
+            } };
+        },
     }
-    return switch (char) {
-        '+' => &.{ .one_many = left },
-        '*' => &.{ .zero_many = left },
-        '?' => &.{ .optional = left },
-        '|' => &.{ .either = .{
-            .left = left,
-            .right = try parseExpr(src),
-        } },
-        else => &.{ .sequence = .{
-            .left = left,
-            .right = try parseExpr(src),
-        } },
-    };
+
+    return null;
 }
 
 test "parser" {
@@ -129,4 +157,14 @@ test "parser" {
             .end = &.{'d'},
         } } },
     } } } }, comptime parse("((abc)|d*)+"));
+    try std.testing.expectEqualDeep(Result{ .ok = &Node{ .sequence = .{
+        .left = &Node{ .symbol = Range{
+            .start = &.{'a'},
+            .end = &.{'a'},
+        } },
+        .right = &Node{ .zero_many = &Node{ .symbol = Range{
+            .start = &.{'b'},
+            .end = &.{'b'},
+        } } },
+    } } }, comptime parse("ab*"));
 }
