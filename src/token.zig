@@ -2,19 +2,64 @@
 const std = @import("std");
 const Type = std.builtin.Type;
 
+pub const Info = struct {
+    pattern: []const u8,
+    name: []const u8,
+    skip: bool,
+
+    pub fn init(comptime token: anytype, comptime name: []const u8) Info {
+        err: {
+            switch (@typeInfo(@TypeOf(token))) {
+                .Pointer => return .{
+                    .skip = false,
+                    .pattern = token,
+                    .name = name,
+                },
+                .Type => switch (@typeInfo(token)) {
+                    .Struct => {},
+                    else => break :err,
+                },
+                else => break :err,
+            }
+
+            if (@hasDecl(token, "skip")) {
+                return .{
+                    .skip = true,
+                    .pattern = @field(token, "skip"),
+                    .name = name,
+                };
+            } else if (@hasDecl(token, "capture")) {
+                return .{
+                    .skip = false,
+                    .pattern = @field(token, "capture"),
+                    .name = name,
+                };
+            }
+        }
+
+        @compileError(
+            \\ zlex: expected token regex to be either a string or struct containing
+            \\ a pub string with the name `skip` or `capture`
+        );
+    }
+};
+
 /// Generates an enum, every variant corresponding to a struct field passed in
 /// ---
 /// - `tokens` generate a unique variant for each member of the anonymous struct
 fn TokenTag(comptime tokens: anytype) type {
     const fields = std.meta.fields(@TypeOf(tokens));
-    var variants: [fields.len]Type.EnumField = undefined;
-    for (fields, 0..) |field, idx| {
-        variants[idx] = .{ .name = field.name, .value = idx };
+    var variants = std.BoundedArray(Type.EnumField, fields.len).init(0) catch unreachable;
+    for (fields) |field| {
+        const value = @field(tokens, field.name);
+        if (field.type == type and @hasField(value, "skip")) continue;
+        variants.appendAssumeCapacity(.{ .name = field.name, .value = variants.len });
     }
 
+    const final = variants.slice()[0..].*;
     return @Type(Type{ .Enum = .{
-        .tag_type = std.math.IntFittingRange(0, fields.len),
-        .fields = &variants,
+        .tag_type = std.math.IntFittingRange(0, variants.len),
+        .fields = &final,
         .decls = &.{},
         .is_exhaustive = false,
     } });
@@ -23,7 +68,7 @@ fn TokenTag(comptime tokens: anytype) type {
 /// Generates a union with every variant corresponding to a struct field passed in
 /// ---
 /// - `fields` fields to generate variants for
-fn Token(comptime tokens: anytype) type {
+pub fn Token(comptime tokens: anytype) type {
     const Tag = TokenTag(tokens);
     const tag_variants = std.meta.fields(Tag);
     var union_variants: [tag_variants.len]Type.UnionField = undefined;

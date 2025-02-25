@@ -95,12 +95,26 @@ fn BitSet(comptime dfa: []const State) type {
 }
 
 /// Gets the final states from a dfa as a set
-fn finalStates(comptime dfa: []const State) BitSet(dfa) {
-    var set = BitSet(dfa).initEmpty();
-    for (dfa, 0..) |d, i| {
-        if (d.token != null) set.set(i);
+fn finalStates(comptime dfa: []const State) []const BitSet(dfa) {
+    // First get the number of unique final states
+    var unique = std.BoundedArray(usize, dfa.len).init(0) catch unreachable;
+    for (dfa) |state| {
+        const tok = state.token orelse continue;
+        if (std.mem.indexOfScalar(usize, unique.slice(), tok)) |_| continue;
+        unique.appendAssumeCapacity(tok);
     }
-    return set;
+
+    var sets = std.BoundedArray(BitSet(dfa), unique.len).init(0) catch unreachable;
+    for (unique.slice()) |tok| {
+        var set = BitSet(dfa).initEmpty();
+        for (dfa, 0..) |d, i| {
+            if (d.token == tok) set.set(i);
+        }
+        sets.appendAssumeCapacity(set);
+    }
+
+    const final = sets.slice()[0..].*;
+    return &final;
 }
 
 /// This will get every state that transitions to any state in `s` on transition `c`
@@ -128,6 +142,7 @@ fn visitStateSet(
 
     // Go through every state in set to get information about the new dfa state
     const dfa_state = states.addOneAssumeCapacity();
+    dfa_state.* = .{};
     visited[state] = states.len - 1;
     var iter = set.iterator(.{});
     while (iter.next()) |s| {
@@ -159,19 +174,32 @@ fn visitStateSet(
 /// There won't be any unreachable states, so just remove duplicate states
 /// This uses hopcroft's algorithm, which tbh I am not quite sure how it works
 fn minimize(dfa: []const State) []const State {
-    // All states and final states
+    // Since each state should be a seperate partition, we get an array of final state partitions
     const f = finalStates(dfa);
-    const q = BitSet(dfa).initFull();
+    const f_all = blk: {
+        var all = BitSet(dfa).initEmpty();
+        for (f) |set| {
+            all.setUnion(set);
+        }
+        break :blk all;
+    };
+    
+    // All states that are not final states
+    const not_final = BitSet(dfa).initFull().differenceWith(f_all);
 
     // Partitions?
     var p = std.BoundedArray(BitSet(dfa), dfa.len + 1).init(0) catch unreachable;
-    p.appendAssumeCapacity(f);
-    p.appendAssumeCapacity(q.differenceWith(f));
+    for (f) |set| {
+        p.appendAssumeCapacity(set);
+    }
+    p.appendAssumeCapacity(not_final);
 
     // Words?
     var w = std.BoundedArray(BitSet(dfa), dfa.len + 1).init(0) catch unreachable;
-    w.appendAssumeCapacity(f);
-    w.appendAssumeCapacity(q.differenceWith(f));
+    for (f) |set| {
+        w.appendAssumeCapacity(set);
+    }
+    w.appendAssumeCapacity(not_final);
 
     while (w.len > 0) {
         const a = w.orderedRemove(0);

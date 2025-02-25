@@ -85,7 +85,7 @@ fn parseSuffix(comptime src: *[]const u8, left: *const Node) Error!?*const Node 
         } },
         else => &.{ .sequence = .{
             .left = left,
-            .right = try parsePrefix(src),
+            .right = try parseExpr(src),
         } },
     };
 }

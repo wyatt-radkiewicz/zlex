@@ -62,6 +62,7 @@ fn normalizeNfa(nfa: *Nfa, start: usize) void {
 /// returns:
 /// - starting state
 pub fn construct(ast: *const parser.Node, token: usize) []const State {
+    @setEvalBranchQuota(1000 * 1000 * 1000);
     var nfa = Nfa.init(0) catch unreachable;
     const final = addState(&nfa, .{
         .trans = .{ null, null },
@@ -177,7 +178,7 @@ pub fn combine(nfas: []const []const State) []const State {
             all.appendAssumeCapacity(with_offset);
         }
     }
-    
+
     const final = all.slice()[0..].*;
     return &final;
 }
@@ -217,7 +218,7 @@ pub const Neighbors = struct {
                 var left = 0;
                 var right = self.seen.len;
                 while (right - left > 1) {
-                    const mid = left + right / 2;
+                    const mid = (left + right) / 2;
                     const val = self.seen.get(mid);
 
                     if (state > val) {
@@ -391,6 +392,34 @@ test "nfa construction" {
             .on = testSingleBitset('a'),
         }, null }, .token = null },
     }, comptime construct(parser.parse("a?").ok, 0));
+    try std.testing.expectEqualSlices(State, &.{
+        State{ .trans = .{ .{
+            .to = 4,
+            .on = testSingleBitset('a'),
+        }, null }, .token = null },
+        State{ .trans = .{
+            null,
+            null,
+        }, .token = 0 },
+        State{ .trans = .{ .{
+            .to = 3,
+            .on = .lambda,
+        }, .{
+            .to = 1,
+            .on = .lambda,
+        } }, .token = null },
+        State{ .trans = .{ .{
+            .to = 2,
+            .on = testSingleBitset('b'),
+        }, null }, .token = null },
+        State{ .trans = .{ .{
+            .to = 3,
+            .on = .lambda,
+        }, .{
+            .to = 2,
+            .on = .lambda,
+        } }, .token = null },
+    }, comptime construct(parser.parse("ab*").ok, 0));
 }
 
 test "nfa combination" {
